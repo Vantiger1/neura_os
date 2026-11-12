@@ -6,9 +6,11 @@ and what is deliberately left for follow-up PRs. The design rationale for
 each upgrade lives in `docs/NEURA_ATTUNED_UPGRADES.md`; this file is the
 practical guide.
 
-Grounded against `Neura` commit `a70169a` (PR #194). One commit,
-12 files, additive only. No existing file changes except one line in
-`rust/src/lib.rs` that registers the new module.
+Grounded against `Neura` commit `a70169a` (PR #194). Two commits,
+additive except for one line in `rust/src/lib.rs` and the repair wiring
+inside `lib/intelligence/neura_intelligence_controller.dart` (new methods and
+one extra input to the existing `recentlyDeclined` path; no existing
+behaviour removed).
 
 ---
 
@@ -47,16 +49,19 @@ rust/src/attunement/prosody.rs                      PCM16 -> delivery statistics
 rust/src/attunement/rhythm.rs                       cosinor rhythm model (24 h / 7 d)
 rust/src/attunement/nof1.rs                         N-of-1 ABAB experiment analysis
 rust/src/attunement/forecast.rs                     Brier-scored forecast ledger + calibration
+rust/src/attunement/state.rs                        one JSON-persistable bundle + hints() for the kernel
 
 lib/attunement/vocal_entrainment_policy.dart        TTS-rate co-regulation policy (pure Dart)
 lib/intelligence/rupture_repair.dart                rupture/repair state machine (pure Dart)
+lib/intelligence/neura_intelligence_controller.dart  MODIFIED: repair engine wired in (see 5.6)
 
 test/attunement/vocal_entrainment_policy_test.dart  12 tests
 test/intelligence/rupture_repair_test.dart          13 tests
+test/intelligence/neura_intelligence_controller_test.dart  MODIFIED: +6 wiring tests
 ```
 
-Rust: 31 unit tests (mod 2, prosody 8, rhythm 6, nof1 7, forecast 8).
-Dart: 25 tests.
+Rust: 40 unit tests (mod 2, prosody 8, rhythm 6, nof1 7, forecast 8, state 9).
+Dart: 31 tests.
 
 ---
 
@@ -91,7 +96,8 @@ cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets -- -D warnin
 
 flutter pub get --enforce-lockfile
 flutter analyze --fatal-infos
-flutter test --no-pub test/attunement test/intelligence/rupture_repair_test.dart
+flutter test --no-pub test/attunement test/intelligence/rupture_repair_test.dart \
+  test/intelligence/neura_intelligence_controller_test.dart
 git diff --check
 ```
 
@@ -100,11 +106,11 @@ What was run before the patch was cut, and what was not:
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --check` | clean |
-| `cargo test --all-targets` | 83 lib tests pass (52 existing + 31 new); all integration suites pass |
+| `cargo test --all-targets` | 92 lib tests pass (52 existing + 40 new); all integration suites pass |
 | `cargo clippy -D warnings` | clean |
 | `git diff --check` | clean |
 | Toolchain | **stable 1.97**, not the pinned 1.99.1 (its download was blocked in the authoring environment). Expect no difference for std-only code, but CI on the pinned toolchain is the real gate. |
-| `flutter analyze` / `flutter test` | **not run** — no Flutter SDK in the authoring environment. The two Dart files were written against the repository's `flutter_lints` set and hand-checked for type errors (`num`/`double` from `clamp`, const asserts, imports). Treat the Dart gate as the first thing to run. |
+| `flutter analyze` / `flutter test` | **not run** — no Flutter SDK in the authoring environment. The Dart files were written against the repository's `flutter_lints` set and hand-checked for type errors (`num`/`double` from `clamp`, const asserts, imports). The controller wiring touches a file with existing tests; run `test/intelligence/neura_intelligence_controller_test.dart` first. |
 
 ---
 
@@ -281,6 +287,17 @@ if (s.move == NeuraRepairMove.acknowledgeAndAsk) {
 }
 ```
 
+**Wired into `NeuraIntelligenceController`.** `recordOutcome` observes
+accepted/dismissed automatically. `observeAttunementSignal(signal)` is the
+entry point for reflex interruptions, corrections and reply feedback.
+`evaluateCandidates` ORs `repairState.suggestsSuppression` into the kernel's
+existing `recentlyDeclined` input (score −0.15 and softened copy, never a
+block) and appends `Rupture & Repair: <reason>` to each receipt while active.
+`beginRepair()` returns an id only when the engine asked; `completeRepair()`
+queues a `NeuraCorrectionProposal` in `pendingCorrections` (memory only,
+max 8, never persisted); `resolveCorrection(id)` removes it once admitted or
+discarded. Data wipe resets all of it.
+
 **Rules.** Pressure decays with a 30-minute half-life. Weights: dismissal
 +0.18, correction +0.45, reflex interruption +0.35, negative feedback +0.40,
 accepted −0.20, positive −0.30, repair answered −0.75. ≥ 0.35 → `quietDown`;
@@ -290,27 +307,51 @@ after 10 minutes. Categories are a fixed list of six; the only stored text is
 the user's own correction inside a proposal they can discard. Tightening
 only: it can make Neura quieter, never louder, and it can grant nothing.
 
+### 5.7 `attunement::state` — one blob to persist, one call per evaluation
+
+```rust
+use neura_swarm::attunement::state::AttunementState;
+
+let mut state = AttunementState::from_json(&stored_or_empty);   // corrupt -> fresh
+state.observe_rhythm("mood", RhythmObservation { week_secs, value, day_key });
+state.observe_prosody(&snapshot);                                 // returns delta vs prior baseline
+state.record_forecast(forecast);  state.resolve_forecast(&id, outcome, now);
+state.start_experiment("walk", vec![Baseline, Intervention, Baseline, Intervention], now);
+state.record_experiment_score("walk", 6.5);  state.advance_experiment("walk");
+let hints = state.hints("mood", week_secs_now, Some(latest_mood), last_prosody.as_ref(), 0.6);
+// hints.in_rhythm_dip, rhythm_confidence, daily_trough_hour, rhythm_surprise,
+// reputation_multipliers (sources past the 10-forecast minimum), prosody_delta
+prefs.set("neura.attunement.state.v1", state.to_json()?);         // the wipe clears this key
+state.retain_recent_rhythm(today_key);                            // 90-day retention
+state.clear();                                                    // wipe / "forget what you learned"
+```
+
+Bounds: 2,000 observations per rhythm signal, 8 experiments, 64 scores per
+block, forecast ledger limits from 5.4. A blob with a newer `version` than
+this build understands is treated as empty rather than misread.
+
 ---
 
 ## 6. Wiring left for follow-up PRs (in recommended order)
 
-1. **Rupture & Repair wiring.** In `NeuraIntelligenceController.recordOutcome`,
-   map `acted`/`dismissed` to `observe`; map `NeuraReflexCommand.stop/beQuiet/
-   cancel` to `reflexInterruption`; map the compassionate policy's
-   `frustrated` to `explicitCorrection`. OR `suggestsSuppression` into the
-   existing `recentlyDeclined` input. One repair chip through the proactive
-   banner service. Proposals to the engine-vision milestone-3 review queue,
-   or to the Intelligence Center as a pending correction until that exists.
-2. **Forecast Ledger wiring.** Persist under `neura.attunement.forecasts.v1`
-   in the prefs store the wipe clears; multiply `reputation_multiplier` into
-   `specialistReputation` where the policy is assembled; "How often Neura is
-   right" panel from `calibration()` in `intelligence_center_screen.dart`.
-3. **Personal Rhythm wiring.** Two `RhythmModel`s (mood check-ins, bandwidth
-   energy), observations persisted (bounded, 90 days) under
-   `neura.attunement.rhythm.v1`, cleared on timezone/DST change and when
-   learning is disabled, through the routine model's existing drain path.
-   New specialist `initiative.rhythm_dip`; new tightening-only
-   `rhythmSurprise` input on `NeuraAutonomyPolicy`.
+1. **Repair surfaces.** Call `observeAttunementSignal` from
+   `NeuraReflexSafetyLayer` (`stop`/`beQuiet`/`cancel` while speaking →
+   `reflexInterruption`) and from the compassionate policy (`frustrated` →
+   `explicitCorrection`). One repair chip through the proactive banner
+   service using `beginRepair`/`completeRepair`. Show `pendingCorrections` in
+   the Intelligence Center with accept/discard until the milestone-3 review
+   queue exists. The controller side is done.
+2. **Expose `AttunementState` to Dart.** Either FRB functions in
+   `rust/src/api.rs` (`attunement_load/save/hints/observe_*`) with regenerated
+   bindings, or the sidecar envelope. Persist the blob under
+   `neura.attunement.state.v1`; clear it in the wipe and when learning is
+   disabled; call `retain_recent_rhythm` daily; drop rhythm observations on
+   a timezone/DST offset change as the routine model does.
+3. **Consume `hints()`.** Multiply `reputation_multipliers` into
+   `specialistReputation` where the policy is assembled; add
+   `initiative.rhythm_dip` (fires inside the dip window at confidence ≥ 0.6);
+   add a tightening-only `rhythmSurprise` input to `NeuraAutonomyPolicy`;
+   "How often Neura is right" panel from `calibration()`.
 4. **Prosody wiring.** Either add `attunement_prosody_push/snapshot/reset` to
    `rust/src/api.rs` and regenerate FRB bindings, or run the analyzer in the
    sidecar and return the snapshot over the envelope. The mic driver forwards

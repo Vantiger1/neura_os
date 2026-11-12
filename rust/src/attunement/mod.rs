@@ -14,11 +14,13 @@
 //! | [`rhythm`] | timestamped scores (mood check-ins, energy estimates) | daily / weekly cosinor fit, predicted dips, surprise |
 //! | [`nof1`] | per-block check-in scores for a user-chosen tiny experiment | effect size, bootstrap interval, plain verdict |
 //! | [`forecast`] | Neura's own predictions and how they resolved | Brier scores, calibration, bounded reputation multiplier |
+//! | [`state`] | all of the above | one JSON-persistable bundle and the per-evaluation `hints()` the kernel reads |
 
 pub mod forecast;
 pub mod nof1;
 pub mod prosody;
 pub mod rhythm;
+pub mod state;
 
 /// Clamp a value into `0.0..=1.0`, mapping NaN to `0.0` so a bad input can
 /// never propagate an unbounded or undefined signal into a policy.

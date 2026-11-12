@@ -16,6 +16,8 @@
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use super::unit;
 
 /// Reputation bounds mirror `NeuraAutonomyKernel.{min,max}SpecialistReputation`.
@@ -31,7 +33,7 @@ pub const MAX_SCORED: usize = 2_000;
 pub const MAX_OPEN: usize = 256;
 
 /// A prediction awaiting resolution.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Forecast {
     pub id: String,
     pub source: String,
@@ -42,7 +44,7 @@ pub struct Forecast {
 }
 
 /// A resolved, scored forecast.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScoredForecast {
     pub source: String,
     pub probability: f64,
@@ -52,7 +54,7 @@ pub struct ScoredForecast {
 }
 
 /// One calibration bin for a source.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationBin {
     pub lower: f64,
     pub upper: f64,
@@ -62,7 +64,7 @@ pub struct CalibrationBin {
 }
 
 /// Skill summary for one source.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceSkill {
     pub scored: usize,
     pub mean_brier: f64,
@@ -71,7 +73,7 @@ pub struct SourceSkill {
     pub reputation_multiplier: f64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForecastLedger {
     open: Vec<Forecast>,
     scored: VecDeque<ScoredForecast>,
@@ -138,6 +140,14 @@ impl ForecastLedger {
     pub fn clear(&mut self) {
         self.open.clear();
         self.scored.clear();
+    }
+
+    /// Distinct sources with at least one scored forecast, sorted.
+    pub fn sources(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.scored.iter().map(|f| f.source.clone()).collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     pub fn skill(&self, source: &str) -> SourceSkill {

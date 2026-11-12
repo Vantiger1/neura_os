@@ -13,6 +13,8 @@
 //! sound faster / flatter than usual", with the confidence attached, and only
 //! as one more piece of evidence for the existing kernels.
 
+use serde::{Deserialize, Serialize};
+
 use super::{normalize, unit};
 
 /// Lowest fundamental frequency searched, in hertz.
@@ -72,7 +74,7 @@ pub struct ProsodyAnalyzer {
 }
 
 /// One session's content-free delivery statistics.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProsodySnapshot {
     /// Audio analysed so far, in seconds.
     pub duration_secs: f64,
@@ -369,7 +371,7 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 /// Per-user baseline of delivery statistics, so "faster than usual" is
 /// relative to this person rather than to a population norm. Holds only
 /// exponential moving averages of the numeric fields.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProsodyBaseline {
     pub sessions: u32,
     pub syllable_rate_hz: f64,
@@ -383,7 +385,7 @@ pub struct ProsodyBaseline {
 
 /// How a session compares with the baseline, as signed fractions of the
 /// baseline value (`+0.2` means 20 % above usual). Zero when no baseline.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProsodyDelta {
     pub syllable_rate: f64,
     pub f0_median: f64,

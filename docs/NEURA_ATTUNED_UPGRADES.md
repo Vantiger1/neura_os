@@ -25,9 +25,10 @@ or executes an action.
 | 1 | Prosody Sense | `attunement::prosody` analyzer + per-user baseline | FRB/stream wiring from `NeuraMicDriver`, Rive inputs, settings toggle |
 | 2 | Vocal Co-regulation | `NeuraVocalEntrainmentPolicy` (Dart) | Hook into `NeuraTtsService` before each reply; settings toggle |
 | 3 | Personal Rhythm | `attunement::rhythm` cosinor model | Observation feed from mood/bandwidth, `initiative.rhythm_dip` specialist |
-| 4 | Forecast Ledger | `attunement::forecast` Brier/calibration ledger | Persistence in the prefs store the wipe clears; Intelligence Center panel |
-| 5 | Tiny Experiments | `attunement::nof1` N-of-1 engine | Experiment setup card in Care/Coach; Weekly recap line |
-| 6 | Rupture & Repair | `NeuraRuptureRepairEngine` (Dart) | Signal mapping in the controller; one repair chip; proposal → memory review |
+| 4 | Forecast Ledger | `attunement::forecast` Brier/calibration ledger; persisted inside `attunement::state` | Intelligence Center panel; multiplier fed into `specialistReputation` |
+| 5 | Tiny Experiments | `attunement::nof1` N-of-1 engine; experiment lifecycle in `attunement::state` | Setup card in Care/Coach; Weekly recap line |
+| 6 | Rupture & Repair | `NeuraRuptureRepairEngine` (Dart) **wired into `NeuraIntelligenceController`** | One repair chip in the banner service; reflex/compassionate signal mapping; proposal → memory review |
+| — | State bundle | `attunement::state::AttunementState`: one JSON blob for all of the above plus `hints()` for the kernel | FRB exposure or sidecar envelope; one prefs key the wipe clears |
 
 ---
 
@@ -278,13 +279,26 @@ fixed list (`timing`, `tone`, `topic`, `frequency`, `misunderstanding`,
 `other`) into a `NeuraCorrectionProposal` that must still pass the memory
 review flow. Answering relieves most of the pressure.
 
-Wiring (not shipped): map outcomes in `NeuraIntelligenceController.
-recordOutcome`, reflex commands, and the compassionate policy's `frustrated`
-signal onto `observe`; render one repair chip ("I think I got that wrong —
-was it the timing, the tone, or something else?") through the existing
-proactive banner service; route proposals to the milestone-3 review queue, or
-until that exists, to the Intelligence Center as a pending correction with
-accept/discard.
+Wiring (shipped in the controller): `recordOutcome` observes accepted and
+dismissed suggestions automatically; `observeAttunementSignal` takes reflex
+interruptions, corrections and reply feedback from their existing call
+sites; `evaluateCandidates` ORs `suggestsSuppression` into the kernel's
+`recentlyDeclined` input and appends a `Rupture & Repair:` reason to every
+receipt while suppression is active, so the Trust Lens shows why Neura went
+quiet; `beginRepair` / `completeRepair` / `pendingCorrections` /
+`resolveCorrection` hold proposals in memory only (never persisted) until the
+milestone-3 review queue exists; `resetAfterDataWipe` clears everything.
+Six controller tests cover the hold-back reason, repair gating, proposal
+queueing, Safe Mode, the wipe, and that correction text never reaches the
+prefs store.
+
+Wiring (not shipped): call `observeAttunementSignal` from
+`NeuraReflexSafetyLayer` (`stop`/`beQuiet`/`cancel` while speaking →
+`reflexInterruption`) and from the compassionate policy (`frustrated` →
+`explicitCorrection`); render one repair chip ("I think I got that wrong —
+was it the timing, the tone, or something else?") through the proactive
+banner service; show `pendingCorrections` in the Intelligence Center with
+accept/discard until the review queue lands.
 
 **Boundaries:** no text parsing; the only stored text is the user's own
 correction inside a proposal they can discard. Safe Mode never asks. A
@@ -299,6 +313,21 @@ routing.
 
 ---
 
+## State bundle — `attunement::state`
+
+`AttunementState` is what the Dart side persists: one compact JSON string
+under one key (`neura.attunement.state.v1`) in the prefs store the data wipe
+already clears. It owns the prosody baseline, bounded rhythm observations per
+signal (2,000 each, 90-day retention), the forecast ledger and up to eight
+tiny experiments with their block plans. `from_json` tolerates corrupt or
+future blobs by returning a fresh state. `hints(signal, week_secs,
+latest_score, latest_prosody, min_confidence)` returns the exact per-evaluation
+inputs the kernel and initiative sources need: `in_rhythm_dip`,
+`rhythm_confidence`, `daily_trough_hour`, `rhythm_surprise`,
+`reputation_multipliers` (only sources past the 10-forecast minimum) and
+`prosody_delta` (only after three baseline sessions). Nine tests cover the
+round trip, bounds, retention, hints, experiment lifecycle and `clear()`.
+
 ## Validation for this change
 
 Run from the repository root with the branch toolchains:
@@ -308,24 +337,30 @@ cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 cargo test --manifest-path rust/Cargo.toml --locked --lib attunement
 cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets -- -D warnings
 flutter analyze --fatal-infos
-flutter test --no-pub test/attunement test/intelligence/rupture_repair_test.dart
+flutter test --no-pub test/attunement test/intelligence/rupture_repair_test.dart \
+  test/intelligence/neura_intelligence_controller_test.dart
 ```
 
-Rust: 31 new tests pass; `cargo fmt --check` and strict Clippy are clean on
+Rust: 40 new tests pass (92 lib tests in all); `cargo fmt --check` and strict Clippy are clean on
 the author's toolchain (stable 1.97; the pinned 1.99.1 could not be
 downloaded in that environment, so CI on the pinned toolchain is required).
-Dart: the two policy files and their tests were written to the repository's
-lint set but **were not executed** by the author, who had no Flutter SDK;
-`flutter analyze` and the two test files are the first gate.
+Dart: the two policy files, the controller wiring and their tests (25 policy
+tests plus 6 controller tests) were written to the repository's lint set but
+**were not executed** by the author, who had no Flutter SDK; `flutter
+analyze` and `test/intelligence/neura_intelligence_controller_test.dart` are
+the first gate.
 
 ## Order of work
 
 1. Land this foundation (review the maths and boundaries, run the gates).
-2. §6 Rupture & Repair wiring — smallest, highest felt impact, no new data.
-3. §4 Forecast Ledger wiring — unlocks honest confidence for everything else.
-4. §3 Personal Rhythm wiring + `initiative.rhythm_dip`.
-5. §1 Prosody wiring behind its toggle, then §2 Co-regulation behind its own.
-6. §5 Tiny Experiments UI, recording a forecast per experiment.
+2. §6 repair chip + reflex/compassionate signal mapping (controller is wired).
+3. Expose `AttunementState` to Dart (FRB functions or sidecar envelope) and
+   persist it under one key; feed `hints().reputation_multipliers` into
+   `specialistReputation` (§4) and `in_rhythm_dip` / `rhythm_surprise` into a
+   new `initiative.rhythm_dip` specialist and a tightening-only policy input (§3).
+4. §1 Prosody wiring behind its toggle, then §2 Co-regulation behind its own.
+5. §5 Tiny Experiments UI over the state bundle's experiment lifecycle,
+   recording a forecast per experiment.
 
 Each step is a reviewable PR with its own evidence. None of them mark the
 engine vision's milestones complete.

@@ -18,6 +18,8 @@
 
 use std::f64::consts::TAU;
 
+use serde::{Deserialize, Serialize};
+
 use super::unit;
 
 /// Seconds in one day.
@@ -35,7 +37,7 @@ pub const MIN_SPAN_DAYS: usize = 5;
 const FULL_CONFIDENCE_OBSERVATIONS: f64 = 60.0;
 
 /// One scored, timestamped sample.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RhythmObservation {
     /// Seconds since local Monday 00:00 of that observation's week.
     pub week_secs: f64,
@@ -46,7 +48,7 @@ pub struct RhythmObservation {
 }
 
 /// Least-squares cosinor parameters for one period.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CosinorFit {
     pub period_secs: f64,
     /// Rhythm-adjusted mean.
@@ -166,7 +168,7 @@ fn solve_3x3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 /// Daily and weekly rhythm of one scored signal.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RhythmModel {
     pub daily: Option<CosinorFit>,
     pub weekly: Option<CosinorFit>,
@@ -175,7 +177,7 @@ pub struct RhythmModel {
 }
 
 /// How a fresh value compares with what the rhythm expected.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RhythmSurprise {
     pub expected: f64,
     pub actual: f64,

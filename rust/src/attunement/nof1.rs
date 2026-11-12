@@ -13,22 +13,24 @@
 //! crate stays dependency-free. A verdict of "too little data" is a first
 //! class answer, not a failure.
 
+use serde::{Deserialize, Serialize};
+
 /// Which arm a block belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Baseline,
     Intervention,
 }
 
 /// One contiguous block of scores collected under a single phase.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Block {
     pub phase: Phase,
     pub scores: Vec<f64>,
 }
 
 /// Plain-language outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// The interval excludes zero on the positive side by at least the
     /// minimal important difference.
@@ -42,7 +44,7 @@ pub enum Verdict {
 }
 
 /// Analysis settings.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentConfig {
     /// Completed baseline+intervention pairs required.
     pub min_cycles: usize,
