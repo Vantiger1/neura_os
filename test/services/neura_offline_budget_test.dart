@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:neuro_companion/services/neura_offline_budget.dart';
@@ -49,6 +51,61 @@ void main() {
     expect(retained.length, 7);
     expect(retained.first['role'], 'user');
     expect(retained.last['content'], '24');
+  });
+
+  test('original budgets keep their native shape and limits', () {
+    for (final budget in [
+      NeuraOfflineBudget.compact,
+      NeuraOfflineBudget.standard,
+    ]) {
+      expect(budget.nativeProfile, isNull);
+      expect(budget.maxTurns, 8);
+      expect(budget.minTotalMiB, 7168);
+      expect(budget.minAvailableMiB, 3584);
+    }
+    expect(NeuraOfflineBudget.compact.contextBytes, 750);
+    expect(NeuraOfflineBudget.standard.contextBytes, 1500);
+  });
+
+  test('larger budgets retain more whole turns within their caps', () {
+    final messages = [
+      for (var i = 0; i < 31; i++)
+        turn(i.isEven ? 'user' : 'assistant', '$i ${'x' * 400}')
+    ];
+    int count(NeuraOfflineBudget budget) {
+      final retained = budget.retain(messages);
+      expect(retained.first['role'], 'user');
+      expect(retained.last, messages.last);
+      expect(retained.length, lessThanOrEqualTo(budget.maxTurns));
+      expect(
+          retained.fold<int>(
+              0, (n, m) => n + utf8.encode(m['content'] as String).length),
+          lessThanOrEqualTo(budget.contextBytes));
+      return retained.length;
+    }
+
+    final standard = count(NeuraOfflineBudget.standard);
+    final roomy = count(NeuraOfflineBudget.roomy);
+    final extended = count(NeuraOfflineBudget.extended);
+    expect(standard, lessThan(roomy));
+    expect(roomy, lessThan(extended));
+    expect(NeuraOfflineBudget.roomy.nativeProfile, 'standard');
+    expect(NeuraOfflineBudget.extended.nativeProfile, 'extended');
+  });
+
+  test('larger budgets mirror stricter native RAM floors', () {
+    const small = NeuraOfflineMemory(8192, 3584);
+    const roomyOk = NeuraOfflineMemory(8192, 4096);
+    const large = NeuraOfflineMemory(16384, 8192);
+    expect(NeuraOfflineBudget.standard.admits(small), isTrue);
+    expect(NeuraOfflineBudget.roomy.admits(small), isFalse);
+    expect(NeuraOfflineBudget.roomy.admits(roomyOk), isTrue);
+    expect(NeuraOfflineBudget.extended.admits(roomyOk), isFalse);
+    expect(NeuraOfflineBudget.extended.admits(large), isTrue);
+  });
+
+  test('keep-warm is off by default', () {
+    expect(NeuraOfflineWarmth.enabled.value, isFalse);
   });
 
   test('rejects tool, image and missing current user messages', () {

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:neuro_companion/services/neura_ai_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:neuro_companion/mood/services/mood_state_service.dart';
 import 'package:neuro_companion/persona/services/neura_prompt_builder.dart';
@@ -37,9 +38,7 @@ void main() {
           includeCurrentMood: false,
           conversationMode: mode,
         );
-        const suffix = '\n\nYou are running offline. Do not claim web access, '
-            'saved memories or completed actions. Offer everyday support; do not '
-            'diagnose or advise medication changes. No tools are available.';
+        const suffix = NeuraAiService.offlineCharterSuffix;
         expect(utf8.encode('$prompt$suffix').length, lessThanOrEqualTo(6500),
             reason: '${mode.name}/${audience.name}');
         expect(prompt, contains('Safe Mode keeps the microphone off'));

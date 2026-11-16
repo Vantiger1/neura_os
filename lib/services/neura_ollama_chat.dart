@@ -339,11 +339,20 @@ class NeuraOllamaChat with WidgetsBindingObserver {
     required String system,
     required List<Map<String, dynamic>> messages,
     required NeuraGenerationCancel cancel,
+    NeuraOfflineBudget budget = NeuraOfflineBudget.standard,
+    bool warm = false,
   }) async {
     if (!_allowed) throw StateError('Offline chat is unavailable.');
     cancel.throwIfCancelled();
     final started = _now;
-    final payload = jsonEncode({'system': system, 'messages': messages});
+    // Optional fields are sent only when chosen, so the default request keeps
+    // its original shape and native limits.
+    final payload = jsonEncode({
+      'system': system,
+      'messages': messages,
+      if (budget.nativeProfile != null) 'profile': budget.nativeProfile,
+      if (warm) 'warm': true,
+    });
     if (utf8.encode(payload).length > 16384) {
       throw StateError('This conversation is too large for offline chat.');
     }
@@ -394,6 +403,7 @@ class NeuraOllamaChat with WidgetsBindingObserver {
       cancel.throwIfCancelled();
       throw StateError(
         'Offline reply unavailable. Open Ollama and install qwen3:4b-instruct. '
+        'If you chose a larger context, free some RAM or choose a smaller one. '
         'No cloud request was made.',
       );
     } finally {
@@ -432,6 +442,7 @@ class NeuraOllamaChat with WidgetsBindingObserver {
       return;
     }
     _blocked = true;
+    NeuraOfflineWarmth.enabled.value = false;
     clearLatency();
     _active?.cancel();
     if (_supported) {

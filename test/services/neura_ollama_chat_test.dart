@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:neuro_companion/services/neura_generation_cancel.dart';
+import 'package:neuro_companion/services/neura_offline_budget.dart';
 import 'package:neuro_companion/services/neura_ollama_chat.dart';
 import 'package:neuro_companion/startup/neura_error_pipeline.dart';
 
@@ -105,6 +106,42 @@ void main() {
       'pollOllama',
       'cancelOllama',
     ]);
+  });
+
+  testWidgets('larger profile and keep-warm are sent only when chosen', (
+    tester,
+  ) async {
+    for (final (budget, warm, profile) in [
+      (NeuraOfflineBudget.compact, false, null),
+      (NeuraOfflineBudget.roomy, false, 'standard'),
+      (NeuraOfflineBudget.extended, true, 'extended'),
+    ]) {
+      calls.clear();
+      expect(
+        await chat.reply(
+          system: 'Neura charter',
+          messages: [
+            {'role': 'user', 'content': 'Hello'},
+          ],
+          cancel: NeuraGenerationCancel('profile-${budget.name}'),
+          budget: budget,
+          warm: warm,
+        ),
+        "Hi, I'm Neura.",
+      );
+      final request =
+          jsonDecode(calls.first.arguments as String) as Map<String, dynamic>;
+      expect(request['profile'], profile);
+      expect(request.containsKey('profile'), profile != null);
+      expect(request['warm'], warm ? true : null);
+      expect(request.containsKey('warm'), warm);
+    }
+  });
+
+  testWidgets('Safe Mode switches keep-warm off', (tester) async {
+    NeuraOfflineWarmth.enabled.value = true;
+    safe.value = true;
+    expect(NeuraOfflineWarmth.enabled.value, isFalse);
   });
 
   Map<String, dynamic> nativeTiming({int outcome = 1}) => {

@@ -100,6 +100,19 @@ class NeuraAiService {
 
   static const _maxToolRounds = 4;
 
+  /// Appended to the offline charter. Written as behaviors the local model
+  /// can follow, so Neura talks openly and honestly about what she can do
+  /// instead of only listing prohibitions. It still grants nothing: offline
+  /// chat has no tools, memory recall, web access or cloud fallback.
+  static const offlineCharterSuffix =
+      '\n\nYou are running offline on this device. Talk openly and '
+      "naturally: match the user's length and tone, ask one short question "
+      'when a request is unclear, and say plainly when you are unsure. In this '
+      'chat you cannot '
+      'browse, recall saved notes or take actions; if asked, say so and suggest '
+      'the Neura feature that can help. Never claim an action happened. Offer '
+      'everyday support; do not diagnose or advise medication changes.';
+
   final NeuraLlmDiagnostics _diagnostics = NeuraLlmDiagnostics.instance;
   final NeuraSecureModelRouter _modelRouter;
   final bool Function()? _configuredReader;
@@ -286,12 +299,11 @@ class NeuraAiService {
           threadContext: threadContext,
         );
         final text = await (_ollama ??= NeuraOllamaChat()).reply(
-          system:
-              '$systemPrompt\n\nYou are running offline. Do not claim web access, '
-              'saved memories or completed actions. Offer everyday support; do not '
-              'diagnose or advise medication changes. No tools are available.',
+          system: '$systemPrompt$offlineCharterSuffix',
           messages: recent,
           cancel: cancel,
+          budget: offlineBudget,
+          warm: NeuraOfflineWarmth.enabled.value,
         );
         cancel.throwIfCancelled();
         checkReference();

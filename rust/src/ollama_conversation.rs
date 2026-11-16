@@ -28,10 +28,91 @@ struct Turn {
 struct Request {
     system: String,
     messages: Vec<Turn>,
+    /// Optional, user-selected conversation profile. Absent means `compact`,
+    /// the original limits, so existing callers keep identical behavior.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Optional, user-selected "keep warm": bounded model residency between
+    /// replies. Absent or false keeps the original `keep_alive: 0`.
+    #[serde(default)]
+    warm: Option<bool>,
 }
 
+/// Bounded conversation profiles. Each larger profile raises both the native
+/// context window and its own RAM admission floor, so it is refused rather
+/// than silently degraded on a machine that cannot hold it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Profile {
+    Compact,
+    Standard,
+    Extended,
+}
+
+impl Profile {
+    fn parse(value: Option<&str>) -> Result<Self, ()> {
+        match value {
+            None | Some("compact") => Ok(Self::Compact),
+            Some("standard") => Ok(Self::Standard),
+            Some("extended") => Ok(Self::Extended),
+            Some(_) => Err(()),
+        }
+    }
+    /// Whole recent turns retained, in UTF-8 bytes and in count.
+    fn context_bytes(self) -> usize {
+        match self {
+            Self::Compact => 1_500,
+            Self::Standard => 4_000,
+            Self::Extended => 8_000,
+        }
+    }
+    fn max_turns(self) -> usize {
+        match self {
+            Self::Compact => 8,
+            Self::Standard => 12,
+            Self::Extended => 16,
+        }
+    }
+    fn num_ctx(self) -> u32 {
+        match self {
+            Self::Compact => 2_048,
+            Self::Standard => 4_096,
+            Self::Extended => 8_192,
+        }
+    }
+    fn num_predict(self) -> u32 {
+        match self {
+            Self::Compact => 256,
+            Self::Standard => 512,
+            Self::Extended => 1_024,
+        }
+    }
+    /// Compact keeps the measured Windows floor. Larger windows add KV-cache
+    /// memory, so they require more headroom. Device measurement remains
+    /// required before these floors are relaxed.
+    pub(crate) fn admits(self, total_mib: u64, available_mib: u64) -> bool {
+        if !crate::local_model::memory_values_admitted(total_mib, available_mib) {
+            return false;
+        }
+        match self {
+            Self::Compact => true,
+            Self::Standard => available_mib >= 4_096,
+            Self::Extended => total_mib >= 15_360 && available_mib >= 8_192,
+        }
+    }
+}
+
+/// Residency while the user explicitly keeps the model warm. Ollama unloads
+/// the model by itself after this idle period; no Neura process holds it.
+const WARM_KEEP_ALIVE: &str = "3m";
+
+#[cfg(test)]
 fn prepare(raw: &[u8]) -> Result<Value, ()> {
+    prepare_with_profile(raw).map(|(payload, _)| payload)
+}
+
+fn prepare_with_profile(raw: &[u8]) -> Result<(Value, Profile), ()> {
     let request: Request = serde_json::from_slice(raw).map_err(|_| ())?;
+    let profile = Profile::parse(request.profile.as_deref())?;
     if request.system.is_empty()
         || request.system.len() > 6_500
         || request.messages.is_empty()
@@ -45,11 +126,11 @@ fn prepare(raw: &[u8]) -> Result<Value, ()> {
         return Err(());
     }
     // Retain whole recent turns, never truncate the charter or newest message.
-    // A short byte budget complements Ollama's hard 2048-token context limit.
+    // A per-profile byte budget complements Ollama's hard token context limit.
     let mut retained = Vec::new();
     let mut bytes = 0;
-    for turn in request.messages.into_iter().rev().take(8) {
-        if bytes + turn.content.len() > 1_500 {
+    for turn in request.messages.into_iter().rev().take(profile.max_turns()) {
+        if bytes + turn.content.len() > profile.context_bytes() {
             if retained.is_empty() {
                 return Err(());
             }
@@ -64,11 +145,17 @@ fn prepare(raw: &[u8]) -> Result<Value, ()> {
     }
     let mut messages = vec![json!({"role":"system", "content": request.system})];
     messages.extend(retained.into_iter().map(|t| json!(t)));
-    Ok(
+    let keep_alive = if request.warm == Some(true) {
+        json!(WARM_KEEP_ALIVE)
+    } else {
+        json!(0)
+    };
+    Ok((
         json!({"model": LOCAL_MODEL, "messages": messages, "stream": false, "think": false,
-        "keep_alive": 0, "options": {"num_ctx":2048,"num_predict":256,
-        "num_thread":2,"temperature":0.6}}),
-    )
+        "keep_alive": keep_alive, "options": {"num_ctx":profile.num_ctx(),
+        "num_predict":profile.num_predict(), "num_thread":2,"temperature":0.6}}),
+        profile,
+    ))
 }
 
 #[cfg(test)]
@@ -207,8 +294,12 @@ impl Session {
             active.cancel.send_replace(true);
         }
     }
-    fn begin(&mut self, payload: Value) -> i64 {
-        self.begin_checked(payload, memory_admitted)
+    fn begin(&mut self, payload: Value, profile: Profile) -> i64 {
+        self.begin_checked(payload, || {
+            memory_admitted()
+                && crate::local_model::memory_snapshot()
+                    .is_some_and(|(total, available)| profile.admits(total, available))
+        })
     }
     fn begin_checked(&mut self, payload: Value, admit_memory: impl FnOnce() -> bool) -> i64 {
         self.begin_work(Some(payload), admit_memory)
@@ -335,13 +426,13 @@ pub unsafe extern "C" fn neura_ollama_begin(data: *const u8, len: usize) -> i64 
     }
     // SAFETY: the native owner supplies its live std::string allocation.
     let raw = unsafe { std::slice::from_raw_parts(data, len) };
-    let Ok(payload) = prepare(raw) else {
+    let Ok((payload, profile)) = prepare_with_profile(raw) else {
         return -1;
     };
     session()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .begin(payload)
+        .begin(payload, profile)
 }
 
 /// Explicit, argument-free metadata inspection. Shares the cancellable worker,
@@ -534,6 +625,81 @@ mod tests {
         assert!(payload.get("tools").is_none());
     }
     #[test]
+    fn profiles_scale_context_and_reply_limits_only_when_selected() {
+        let request = |extra: &str| {
+            format!(
+                r#"{{"system":"Neura charter","messages":[{{"role":"user","content":"Hello"}}]{extra}}}"#
+            )
+        };
+        for (extra, ctx, predict, profile) in [
+            ("", 2048, 256, Profile::Compact),
+            (r#","profile":"compact""#, 2048, 256, Profile::Compact),
+            (r#","profile":"standard""#, 4096, 512, Profile::Standard),
+            (r#","profile":"extended""#, 8192, 1024, Profile::Extended),
+        ] {
+            let (payload, parsed) = prepare_with_profile(request(extra).as_bytes()).unwrap();
+            assert_eq!(parsed, profile);
+            assert_eq!(payload["options"]["num_ctx"], ctx);
+            assert_eq!(payload["options"]["num_predict"], predict);
+            assert_eq!(payload["keep_alive"], 0);
+            assert!(payload.get("tools").is_none());
+        }
+        for bad in [
+            r#","profile":"huge""#,
+            r#","profile":7"#,
+            r#","warm":"yes""#,
+        ] {
+            assert!(prepare(request(bad).as_bytes()).is_err());
+        }
+    }
+    #[test]
+    fn warm_is_explicit_and_bounded() {
+        let raw = |warm: &str| {
+            format!(
+                r#"{{"system":"x","messages":[{{"role":"user","content":"x"}}],"warm":{warm}}}"#
+            )
+        };
+        assert_eq!(prepare(raw("true").as_bytes()).unwrap()["keep_alive"], "3m");
+        assert_eq!(prepare(raw("false").as_bytes()).unwrap()["keep_alive"], 0);
+    }
+    #[test]
+    fn larger_profiles_retain_more_whole_turns_but_never_truncate() {
+        let turns: Vec<Value> = (0..31)
+            .map(|i| {
+                json!({"role": if i % 2 == 0 {"user"} else {"assistant"},
+                "content": format!("{i} {}", "x".repeat(400))})
+            })
+            .collect();
+        let count = |profile: &str| {
+            let raw = json!({"system":"x","messages":turns,"profile":profile}).to_string();
+            let payload = prepare(raw.as_bytes()).unwrap();
+            let messages = payload["messages"].as_array().unwrap().clone();
+            assert_eq!(messages[1]["role"], "user");
+            assert!(messages[1..]
+                .iter()
+                .all(|m| m["content"].as_str().unwrap().len() > 400));
+            messages.len() - 1
+        };
+        let (compact, standard, extended) =
+            (count("compact"), count("standard"), count("extended"));
+        assert!(compact <= 8 && compact < standard && standard <= 12);
+        assert!(standard < extended && extended <= 16);
+        // A newest turn over the selected profile's budget is refused whole.
+        let big = json!({"system":"x","profile":"standard",
+            "messages":[{"role":"user","content":"x".repeat(4_001)}]});
+        assert!(prepare(big.to_string().as_bytes()).is_err());
+    }
+    #[test]
+    fn larger_profiles_require_more_memory_headroom() {
+        assert!(Profile::Compact.admits(8_192, 3_584));
+        assert!(!Profile::Compact.admits(8_192, 3_000));
+        assert!(!Profile::Standard.admits(8_192, 4_000));
+        assert!(Profile::Standard.admits(8_192, 4_096));
+        assert!(!Profile::Extended.admits(8_192, 7_000));
+        assert!(!Profile::Extended.admits(16_384, 6_000));
+        assert!(Profile::Extended.admits(16_384, 8_192));
+    }
+    #[test]
     fn rejects_tools_images_endpoints_and_large_current_turn() {
         for raw in [
             r#"{"system":"x","messages":[{"role":"tool","content":"x"}]}"#,
@@ -552,7 +718,7 @@ mod tests {
     #[test]
     fn background_and_block_prevent_admission_and_clear_reply() {
         let mut s = Session::default();
-        assert_eq!(s.begin(json!({})), -2);
+        assert_eq!(s.begin(json!({}), Profile::Compact), -2);
         assert_eq!(s.begin_readiness(), -2);
         {
             let mut state = s.state.lock().unwrap();
@@ -564,7 +730,7 @@ mod tests {
         s.cancel();
         assert!(s.state.lock().unwrap().reply.is_none());
         assert!(s.state.lock().unwrap().readiness.is_none());
-        assert_eq!(s.begin(json!({})), -2);
+        assert_eq!(s.begin(json!({}), Profile::Compact), -2);
         assert_eq!(s.begin_readiness(), -2);
         assert!(s.active.is_none());
     }

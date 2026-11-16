@@ -1,15 +1,60 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-/// User-selected context caps; neither profile changes model or permissions.
+/// User-selected context caps; no profile changes model or permissions.
+///
+/// Compact and Standard keep the original native limits. Roomy and Extended
+/// ask the native adapter for a larger, separately RAM-admitted profile
+/// (`standard` / `extended` in Rust) with longer replies and more recent
+/// turns. The native adapter refuses a profile the machine cannot admit; it
+/// never silently falls back to a smaller profile or to the cloud.
 enum NeuraOfflineBudget {
   compact('Compact', 750),
-  standard('Standard', 1500);
+  standard('Standard', 1500),
+  roomy(
+    'Roomy',
+    4000,
+    maxTurns: 12,
+    nativeProfile: 'standard',
+    minAvailableMiB: 4096,
+  ),
+  extended(
+    'Extended',
+    8000,
+    maxTurns: 16,
+    nativeProfile: 'extended',
+    minTotalMiB: 15360,
+    minAvailableMiB: 8192,
+  );
 
-  const NeuraOfflineBudget(this.label, this.contextBytes);
+  const NeuraOfflineBudget(
+    this.label,
+    this.contextBytes, {
+    this.maxTurns = 8,
+    this.nativeProfile,
+    this.minTotalMiB = 7168,
+    this.minAvailableMiB = 3584,
+  });
   final String label;
   final int contextBytes;
+
+  /// Most whole turns retained, including an optional conversation brief.
+  final int maxTurns;
+
+  /// Native profile name, or null to send the original request shape.
+  final String? nativeProfile;
+
+  /// RAM floor mirrored from the native admission check, for display only.
+  /// The Rust adapter remains the enforcing check.
+  final int minTotalMiB;
+  final int minAvailableMiB;
+
+  bool admits(NeuraOfflineMemory memory) =>
+      memory.admitted &&
+      memory.totalMiB >= minTotalMiB &&
+      memory.availableMiB >= minAvailableMiB;
 
   /// Preserve the newest user turn and whole older turns within the byte cap.
   /// Never truncate user text or include an orphaned assistant response.
@@ -28,7 +73,8 @@ enum NeuraOfflineBudget {
         threadBytes + utf8.encode(newest).length <= contextBytes;
     var bytes = useThread ? threadBytes : 0;
     final retained = <Map<String, dynamic>>[];
-    for (final message in messages.reversed.take(useThread ? 7 : 8)) {
+    final turns = useThread ? maxTurns - 1 : maxTurns;
+    for (final message in messages.reversed.take(turns)) {
       final text = message['content'];
       if (text is! String ||
           (message['role'] != 'user' && message['role'] != 'assistant')) {
@@ -85,4 +131,14 @@ class NeuraOfflineMemory {
       return null;
     }
   }
+}
+
+/// Session-only "keep Neura warm" choice. Off at every launch; Safe Mode and
+/// recovery switch it off. When on, the local model may stay loaded for at
+/// most three idle minutes after a reply (Ollama unloads it by itself),
+/// trading RAM for a faster next reply. It never starts inference, loads a
+/// model or downloads anything.
+class NeuraOfflineWarmth {
+  NeuraOfflineWarmth._();
+  static final ValueNotifier<bool> enabled = ValueNotifier<bool>(false);
 }

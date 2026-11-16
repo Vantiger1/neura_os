@@ -217,6 +217,29 @@ class _NeuraOfflineControlsState extends State<NeuraOfflineControls>
                 if (value != null) setState(() => _budget = value);
               },
             ),
+            if (_budget.nativeProfile != null)
+              Text(
+                '${_budget.label} remembers more of this conversation and '
+                'allows longer replies. It needs at least '
+                '${_budget.minTotalMiB} MiB installed and '
+                '${_budget.minAvailableMiB} MiB available; if not, the reply '
+                'is refused rather than shortened.',
+              ),
+            ValueListenableBuilder<bool>(
+              valueListenable: NeuraOfflineWarmth.enabled,
+              builder: (context, warm, _) => SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Keep Neura warm between replies'),
+                subtitle: const Text(
+                  'Faster next reply. The model may stay in RAM for up to '
+                  '3 idle minutes. Off after restart, Safe Mode or recovery.',
+                ),
+                value: warm,
+                onChanged: _blocked
+                    ? null
+                    : (value) => NeuraOfflineWarmth.enabled.value = value,
+              ),
+            ),
             TextButton(
               onPressed: _checking || _blocked ? null : _check,
               child: Text(_checking ? 'Checking…' : 'Check available RAM'),
