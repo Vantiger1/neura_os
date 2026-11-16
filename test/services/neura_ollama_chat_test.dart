@@ -208,7 +208,10 @@ void main() {
       ),
     );
     expect(calls.where((c) => c.method == 'partialOllama'), hasLength(1));
-    expect(calls.any((c) => c.method == 'cancelOllama'), isTrue);
+    final cancels = calls.where((c) => c.method == 'cancelOllama');
+    expect(cancels, isNotEmpty);
+    // Only the request this reply started (id 4) is cancelled.
+    expect(cancels.map((c) => c.arguments), everyElement(4));
   });
 
   Map<String, dynamic> nativeTiming({int outcome = 1}) => {

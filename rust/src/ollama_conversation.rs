@@ -1232,6 +1232,63 @@ mod tests {
         task.abort();
     }
     #[tokio::test]
+    async fn partial_text_grows_before_the_stream_finishes() {
+        use axum::{body::Body, routing::post, Json};
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(4);
+        let body = Arc::new(Mutex::new(Some(receiver)));
+        let router = crate::local_model::tests::metadata_router()
+            .route("/api/show", post(|| async { Json(local_info()) }))
+            .route(
+                "/api/chat",
+                post(move || {
+                    let receiver = body.lock().unwrap().take().unwrap();
+                    async move { Body::from_stream(tokio_stream_from(receiver)) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let partial = Arc::new(Partial::default());
+        let worker_partial = partial.clone();
+        let request = tokio::spawn(async move {
+            timed_inference(
+                &endpoint,
+                stream_payload(),
+                &Mutex::new(RequestTiming::default()),
+                &worker_partial,
+            )
+            .await
+        });
+        let wait_for = |expected: &'static [u8]| {
+            let partial = partial.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while partial.lock().unwrap()[..] != *expected {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        };
+        sender.send(Ok(line("Hi. ", false))).await.unwrap();
+        wait_for(b"Hi. ").await;
+        assert!(!request.is_finished());
+        sender.send(Ok(line("More.", false))).await.unwrap();
+        wait_for(b"Hi. More.").await;
+        assert!(!request.is_finished());
+        sender.send(Ok(line("", true))).await.unwrap();
+        assert_eq!(request.await.unwrap().unwrap(), "Hi. More.");
+        server.abort();
+    }
+    fn tokio_stream_from(
+        mut receiver: tokio::sync::mpsc::Receiver<Result<String, std::io::Error>>,
+    ) -> impl futures_util::Stream<Item = Result<String, std::io::Error>> {
+        futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx))
+    }
+    #[tokio::test]
     async fn streamed_reply_rejects_unsafe_incomplete_and_oversized_streams() {
         let tool =
             json!({"done":false,"message":{"role":"assistant","content":"x","tool_calls":[{}]}});

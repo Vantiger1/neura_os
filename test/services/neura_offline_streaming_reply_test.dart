@@ -74,6 +74,38 @@ void main() {
           }));
 
   test(
+      'a blocked sentence stops native work and shows the safe message',
+      () => fixture.run(() async {
+            NeuraOfflineStreaming.enabled.value = true;
+            const unsafe = "Hello there. I don't want to be alive anymore. ";
+            partials = ['Hello there. I', '${unsafe}More'];
+            final chunks = await ask();
+            expect(chunks.first, 'Hello there.');
+            expect(chunks, hasLength(2));
+            expect(chunks.last, startsWith('\n\n'));
+            expect(chunks.last, contains('I’m here.'));
+            expect(chunks.join(), isNot(contains('alive')));
+            final cancels = calls.where((c) => c.method == 'cancelOllama');
+            expect(cancels.map((c) => c.arguments), contains(1));
+            // The stopped request was never read to completion.
+            expect(calls.where((c) => c.method == 'partialOllama'),
+                hasLength(2));
+          }));
+
+  test(
+      'abandoning the stream cancels native work',
+      () => fixture.run(() async {
+            NeuraOfflineStreaming.enabled.value = true;
+            const turn = NeuraChatTurn(isUser: true, text: 'Hello');
+            final first =
+                await ai.streamReply(const [turn], localOllama: true).first;
+            expect(first, 'Hello there.');
+            await Future<void>.delayed(const Duration(milliseconds: 300));
+            final cancels = calls.where((c) => c.method == 'cancelOllama');
+            expect(cancels.map((c) => c.arguments), contains(1));
+          }));
+
+  test(
       'streaming is off by default and keeps the original request',
       () => fixture.run(() async {
             final chunks = await ask();

@@ -51,8 +51,19 @@ evidence.
 | Change | Where | Behavior |
 | --- | --- | --- |
 | Native streaming | `rust/src/ollama_conversation.rs` (`neura_ollama_partial`), `windows/runner/neura_engine_session.cpp` (`partialOllama`) | With `stream: true` the adapter reads Ollama's NDJSON stream under the same checks as a complete reply (no tools, no remote model, assistant role, reply ≤ 8 KiB) plus a 16 KiB line cap and 512 KiB wire cap. The growing text is readable only for the current, foreground, unblocked request and is cleared by cancel. An older DLL without the export simply never streams. |
-| Screened release | `lib/services/neura_screened_stream.dart`, `NeuraAiService._streamOfflineReply` | Text is released only at sentence boundaries, and only after the guardrails accept **everything shown so far plus the new sentence**. The last release therefore screens the complete reply, the same check a non-streamed reply gets. A block stops native work, releases nothing more and shows the safe message. |
+| Screened release | `lib/services/neura_screened_stream.dart`, `NeuraAiService._streamOfflineReply` | While the reply is being written, text is released only at sentence boundaries, and only after the guardrails accept **everything shown so far plus the new sentence**. When the reply finishes, any final fragment without a sentence break is released after the whole reply is screened, so the last release always screens the complete reply, the same check a non-streamed reply gets. A block stops native work, releases nothing more and shows the safe message. Abandoning the stream (for example a superseded turn) cancels native work. |
 | Opt-in switch | `NeuraOfflineStreaming`, offline controls | "Show replies as they're written" is session-only and off by default; Safe Mode and recovery switch it off. Reference-shelf answers never stream: they are verified whole. |
+
+### Known trade-off
+
+Streaming shows sentences before the reply is complete. Every released
+sentence has passed per-line validation (no tool calls, no remote model,
+assistant role, size caps) and screening of all text shown so far. If a
+**later** line is then rejected (for example a tool call, a malformed line or
+an incomplete stream), the earlier screened sentences stay visible and the
+turn ends with the usual offline error; the rejected content itself is never
+shown. Users who want nothing shown until the whole reply is validated keep
+the switch off, which is the default.
 
 Spoken replies use the chat screen's existing streamed-speech path, so Neura
 starts speaking after the first screened sentence when stream speech is on.

@@ -680,25 +680,33 @@ class NeuraAiService {
     }
 
     unawaited(run());
-    while (true) {
-      await wake.future;
-      wake = Completer<void>();
-      while (ready.isNotEmpty) {
-        cancel.throwIfCancelled();
-        yield ready.removeAt(0);
+    try {
+      while (true) {
+        await wake.future;
+        wake = Completer<void>();
+        while (ready.isNotEmpty) {
+          cancel.throwIfCancelled();
+          yield ready.removeAt(0);
+        }
+        if (done) break;
       }
-      if (done) break;
-    }
-    cancel.throwIfCancelled();
-    if (screened.blocked == null) {
-      if (failure != null) Error.throwWithStackTrace(failure!, failureStack!);
-      final rest = await screened.finish(complete!);
       cancel.throwIfCancelled();
-      if (rest.isNotEmpty) yield rest;
-    }
-    final blocked = screened.blocked;
-    if (blocked != null) {
-      yield screened.released.isEmpty ? blocked : '\n\n$blocked';
+      if (screened.blocked == null) {
+        if (failure != null) {
+          Error.throwWithStackTrace(failure!, failureStack!);
+        }
+        final rest = await screened.finish(complete!);
+        cancel.throwIfCancelled();
+        if (rest.isNotEmpty) yield rest;
+      }
+      final blocked = screened.blocked;
+      if (blocked != null) {
+        yield screened.released.isEmpty ? blocked : '\n\n$blocked';
+      }
+    } finally {
+      // A listener that stops listening abandons the reply. Cancel the
+      // generation so polling stops and native inference is cancelled.
+      if (!done) cancel.cancel();
     }
   }
 

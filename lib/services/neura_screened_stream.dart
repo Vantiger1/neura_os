@@ -1,5 +1,7 @@
 /// Releases a streamed offline reply sentence by sentence, never ahead of
-/// screening.
+/// screening. While text is still arriving, only whole sentences are
+/// released; when the reply finishes, [finish] releases any final fragment
+/// without a sentence break after screening the complete reply.
 ///
 /// Every release screens the whole text released so far plus the new
 /// sentence, so the last release screens exactly the complete reply, the same
