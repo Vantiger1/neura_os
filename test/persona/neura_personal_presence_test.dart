@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:neuro_companion/services/neura_ai_service.dart';
 import 'package:neuro_companion/avatar/motion/neura_motion.dart';
 import 'package:neuro_companion/avatar/motion/neura_motion_engine.dart';
 import 'package:neuro_companion/persona/agents/agent_persona_catalog.dart';
@@ -68,10 +69,7 @@ void main() {
             conversationMode: mode,
             includeCurrentMood: false,
           );
-          const suffix =
-              '\n\nYou are running offline. Do not claim web access, '
-              'saved memories or completed actions. Offer everyday support; do not '
-              'diagnose or advise medication changes. No tools are available.';
+          const suffix = NeuraAiService.offlineCharterSuffix;
           expect(utf8.encode('$prompt$suffix').length, lessThanOrEqualTo(6500),
               reason: '${preset.name}/${mode.name}/${audience.name}');
           expect(prompt, contains('fresh user approval'));

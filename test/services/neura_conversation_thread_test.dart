@@ -45,7 +45,7 @@ void main() {
       final retained = budget.retain(messages, threadContext: thread.context);
       expect(retained.first['content'], contains('Friday'));
       expect(retained.last['content'], messages.last['content']);
-      expect(retained.length, lessThanOrEqualTo(8));
+      expect(retained.length, lessThanOrEqualTo(budget.maxTurns));
       expect(
           retained.fold<int>(
               0, (n, m) => n + utf8.encode(m['content'] as String).length),
