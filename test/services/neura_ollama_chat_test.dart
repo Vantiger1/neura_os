@@ -138,10 +138,77 @@ void main() {
     }
   });
 
-  testWidgets('Safe Mode switches keep-warm off', (tester) async {
+  testWidgets('Safe Mode switches keep-warm and streaming off', (tester) async {
     NeuraOfflineWarmth.enabled.value = true;
+    NeuraOfflineStreaming.enabled.value = true;
     safe.value = true;
     expect(NeuraOfflineWarmth.enabled.value, isFalse);
+    expect(NeuraOfflineStreaming.enabled.value, isFalse);
+  });
+
+  void streamingNative(List<String> partials, String reply) {
+    var polls = 0;
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+      call,
+    ) async {
+      calls.add(call);
+      switch (call.method) {
+        case 'beginOllama':
+          return 4;
+        case 'pollOllama':
+          return ++polls > partials.length ? reply : null;
+        case 'partialOllama':
+          return polls <= partials.length ? partials[polls - 1] : null;
+      }
+      return null;
+    });
+  }
+
+  testWidgets('streamed reply hands each new partial to the handler', (
+    tester,
+  ) async {
+    streamingNative(['Hi.', 'Hi. I am', 'Hi. I am'], 'Hi. I am Neura.');
+    final seen = <String>[];
+    final text = await tester.runAsync(
+      () => chat.reply(
+        system: 'Neura charter',
+        messages: [
+          {'role': 'user', 'content': 'Hello'},
+        ],
+        cancel: NeuraGenerationCancel('streamed'),
+        onPartial: (partial) async {
+          seen.add(partial);
+          return true;
+        },
+      ),
+    );
+    expect(text, 'Hi. I am Neura.');
+    // An unchanged snapshot is not offered twice.
+    expect(seen, ['Hi.', 'Hi. I am']);
+    final request = jsonDecode(calls.first.arguments as String);
+    expect(request['stream'], true);
+    expect(calls.where((c) => c.method == 'partialOllama'), hasLength(3));
+  });
+
+  testWidgets('a handler can stop the stream and native work is cancelled', (
+    tester,
+  ) async {
+    streamingNative(['Hi.', 'Hi. More'], 'Hi. More text.');
+    await tester.runAsync(
+      () => expectLater(
+        chat.reply(
+          system: 'Neura charter',
+          messages: [
+            {'role': 'user', 'content': 'Hello'},
+          ],
+          cancel: NeuraGenerationCancel('stopped'),
+          onPartial: (_) async => false,
+        ),
+        throwsA(isA<NeuraOfflineStreamStopped>()),
+      ),
+    );
+    expect(calls.where((c) => c.method == 'partialOllama'), hasLength(1));
+    expect(calls.any((c) => c.method == 'cancelOllama'), isTrue);
   });
 
   Map<String, dynamic> nativeTiming({int outcome = 1}) => {

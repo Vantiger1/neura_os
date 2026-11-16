@@ -22,6 +22,7 @@ EXPORTS = (
     "neura_ollama_foreground", "neura_ollama_block", "neura_ollama_shutdown",
     "neura_ollama_timing", "neura_ollama_clear_timing",
     "neura_ollama_readiness_begin", "neura_ollama_readiness_poll",
+    "neura_ollama_partial",
 )
 REQUIRED = (
     "app/neuro_companion.exe", "app/flutter_windows.dll", "app/neura_swarm.dll",

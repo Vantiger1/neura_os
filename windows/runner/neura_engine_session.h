@@ -41,6 +41,8 @@ class NeuraEngineSession {
   bool blocked_ = false;
   OllamaBegin ollama_begin_ = nullptr;
   OllamaPoll ollama_poll_ = nullptr;
+  // Optional: absent in DLLs built before screened streaming.
+  OllamaPoll ollama_partial_ = nullptr;
   OllamaCancel ollama_cancel_ = nullptr;
   OllamaTiming ollama_timing_ = nullptr;
   OllamaReadinessBegin ollama_readiness_begin_ = nullptr;

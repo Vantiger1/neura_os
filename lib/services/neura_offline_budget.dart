@@ -142,3 +142,13 @@ class NeuraOfflineWarmth {
   NeuraOfflineWarmth._();
   static final ValueNotifier<bool> enabled = ValueNotifier<bool>(false);
 }
+
+/// Session-only "show replies as they're written" choice. Off at every
+/// launch; Safe Mode and recovery switch it off. When on, offline replies
+/// stream sentence by sentence, and each sentence is released only after
+/// everything shown so far passes the same guardrails as a complete reply.
+/// Reference-shelf answers never stream: they are verified whole.
+class NeuraOfflineStreaming {
+  NeuraOfflineStreaming._();
+  static final ValueNotifier<bool> enabled = ValueNotifier<bool>(false);
+}

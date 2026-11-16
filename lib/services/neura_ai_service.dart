@@ -33,6 +33,7 @@ import 'neura_model_types.dart';
 import 'neura_provider_credentials.dart';
 import 'neura_ollama_chat.dart';
 import 'neura_offline_budget.dart';
+import 'neura_screened_stream.dart';
 import 'neura_companion_presence.dart';
 import '../reference/neura_reference_shelf.dart';
 
@@ -298,6 +299,15 @@ class NeuraAiService {
           localMessages,
           threadContext: threadContext,
         );
+        if (offlineReference == null && NeuraOfflineStreaming.enabled.value) {
+          yield* _streamOfflineReply(
+            system: '$systemPrompt$offlineCharterSuffix',
+            messages: recent,
+            cancel: cancel,
+            budget: offlineBudget,
+          );
+          return;
+        }
         final text = await (_ollama ??= NeuraOllamaChat()).reply(
           system: '$systemPrompt$offlineCharterSuffix',
           messages: recent,
@@ -618,6 +628,80 @@ class NeuraAiService {
 
   /// Runs the outgoing user message through Guardrails before it reaches the
   /// LLM. Returns a safe-alternative message to show instead if blocked.
+  /// Offline reply released sentence by sentence. Each release screens all
+  /// text shown so far, so the final release screens the complete reply, the
+  /// same check a non-streamed reply receives. A block stops native work and
+  /// replaces the rest of the reply with the safe message.
+  Stream<String> _streamOfflineReply({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required NeuraGenerationCancel cancel,
+    required NeuraOfflineBudget budget,
+  }) async* {
+    final screened = NeuraScreenedStream(
+      (text) => _checkGuardrails([NeuraChatTurn(isUser: true, text: text)]),
+    );
+    final ready = <String>[];
+    var wake = Completer<void>();
+    void signal() {
+      if (!wake.isCompleted) wake.complete();
+    }
+
+    Future<bool> release(String partial) async {
+      final chunk = await screened.offer(partial);
+      if (chunk.isNotEmpty) {
+        ready.add(chunk);
+        signal();
+      }
+      return screened.blocked == null;
+    }
+
+    var done = false;
+    String? complete;
+    Object? failure;
+    StackTrace? failureStack;
+    Future<void> run() async {
+      try {
+        complete = await (_ollama ??= NeuraOllamaChat()).reply(
+          system: system,
+          messages: messages,
+          cancel: cancel,
+          budget: budget,
+          warm: NeuraOfflineWarmth.enabled.value,
+          onPartial: release,
+        );
+      } catch (error, stack) {
+        failure = error;
+        failureStack = stack;
+      } finally {
+        done = true;
+        signal();
+      }
+    }
+
+    unawaited(run());
+    while (true) {
+      await wake.future;
+      wake = Completer<void>();
+      while (ready.isNotEmpty) {
+        cancel.throwIfCancelled();
+        yield ready.removeAt(0);
+      }
+      if (done) break;
+    }
+    cancel.throwIfCancelled();
+    if (screened.blocked == null) {
+      if (failure != null) Error.throwWithStackTrace(failure!, failureStack!);
+      final rest = await screened.finish(complete!);
+      cancel.throwIfCancelled();
+      if (rest.isNotEmpty) yield rest;
+    }
+    final blocked = screened.blocked;
+    if (blocked != null) {
+      yield screened.released.isEmpty ? blocked : '\n\n$blocked';
+    }
+  }
+
   Future<String?> _checkGuardrails(List<NeuraChatTurn> history) async {
     if (history.isEmpty) return null;
     final lastMessage = history.last.text;
