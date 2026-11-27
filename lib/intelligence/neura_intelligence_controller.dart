@@ -14,6 +14,7 @@ import '../startup/neura_prefs_cache.dart';
 import 'autonomy_kernel.dart';
 import 'intelligence_preferences.dart';
 import 'models.dart';
+import 'rupture_repair.dart';
 
 /// Local-first coordinator for Neura's proactive intelligence.
 ///
@@ -39,6 +40,17 @@ class NeuraIntelligenceController extends ChangeNotifier {
   final NeuraAutonomyKernel _kernel = NeuraAutonomyKernel();
   final Guardrails _guardrails = Guardrails();
 
+  /// Rupture-and-repair pressure from content-free outcome signals. Held in
+  /// memory only: its half-life is 30 minutes, so nothing durable is lost on
+  /// restart, and no correction text is ever written to the prefs store.
+  final NeuraRuptureRepairEngine _repair = NeuraRuptureRepairEngine();
+
+  /// Corrections the user supplied through a repair, waiting for review.
+  /// In memory only until the engine-vision milestone-3 review queue exists;
+  /// a restart discards them by design rather than persisting user text.
+  final List<NeuraCorrectionProposal> _pendingCorrections = [];
+  static const _maxPendingCorrections = 8;
+
   NeuraIntelligencePreferences _preferences =
       const NeuraIntelligencePreferences();
   List<NeuraIntelligenceRecord> _records = [];
@@ -51,6 +63,8 @@ class NeuraIntelligenceController extends ChangeNotifier {
 
   NeuraIntelligencePreferences get preferences => _preferences;
   List<NeuraIntelligenceRecord> get records => List.unmodifiable(_records);
+  List<NeuraCorrectionProposal> get pendingCorrections =>
+      List.unmodifiable(_pendingCorrections);
   NeuraCouncilResult get lastCouncil => _lastCouncil;
   bool get initialized => _initialized;
 
@@ -144,6 +158,11 @@ class NeuraIntelligenceController extends ChangeNotifier {
     );
     final focusMode = FocusController.instance.state.value.mode.name;
     final quiet = _preferences.isQuietAt(evaluatedAt);
+    final safeMode = SafeBoot.instance.safeMode.value;
+    // Rupture & Repair can only tighten: elevated attunement pressure feeds
+    // the kernel's existing "recently declined" path rather than a new one.
+    final repair = _repair.state(now: evaluatedAt, safeMode: safeMode);
+    final holdBack = recentlyDeclined || repair.suggestsSuppression;
     final policy = NeuraAutonomyPolicy(
       enabled: _preferences.allowsProactiveSuggestions,
       allowSensitiveSignals: _preferences.allowSensitiveSignals,
@@ -151,8 +170,8 @@ class NeuraIntelligenceController extends ChangeNotifier {
       suggestionsToday: suggestionsToday,
       suggestionsLastHour: suggestionsLastHour,
       focusMode: focusMode,
-      safeMode: SafeBoot.instance.safeMode.value,
-      recentlyDeclined: recentlyDeclined,
+      safeMode: safeMode,
+      recentlyDeclined: holdBack,
       quietHours: quiet,
       specialistReputation: Map.unmodifiable(_specialistReputation),
       constitution: NeuraConstitutionService.instance.current,
@@ -168,6 +187,14 @@ class NeuraIntelligenceController extends ChangeNotifier {
         policy: policy,
         now: evaluatedAt,
       );
+      if (repair.suggestsSuppression) {
+        receipt = receipt.copyWith(
+          reasons: List.unmodifiable([
+            ...receipt.reasons,
+            'Rupture & Repair: ${repair.reasons.first}',
+          ]),
+        );
+      }
       if (receipt.isVisible) {
         final guardrailDecision = _guardrails.evaluate(
           context: NeuraContextSnapshot(
@@ -176,7 +203,7 @@ class NeuraIntelligenceController extends ChangeNotifier {
             promptsLastDay: suggestionsToday,
             userInFocusMode: focusMode == 'deepWork' || focusMode == 'windDown',
             userSleepingMode: quiet,
-            userRecentlyDeclined: recentlyDeclined,
+            userRecentlyDeclined: holdBack,
             distressScore: distressScore.clamp(0.0, 1.0).toDouble(),
           ),
           proposal: NeuraProposal(
@@ -233,11 +260,88 @@ class NeuraIntelligenceController extends ChangeNotifier {
   Future<void> markShown(String receiptId) =>
       _updateOutcome(receiptId, NeuraSuggestionOutcome.shown);
 
-  Future<void> recordOutcome({required String receiptId, required bool acted}) {
+  Future<void> recordOutcome({
+    required String receiptId,
+    required bool acted,
+    DateTime? now,
+  }) {
     return _updateOutcome(
       receiptId,
       acted ? NeuraSuggestionOutcome.acted : NeuraSuggestionOutcome.dismissed,
+      now: now,
     );
+  }
+
+  /// Current rupture-and-repair state, for the Intelligence Center and the
+  /// proactive banner service (which renders the one repair chip).
+  NeuraRuptureState repairState({DateTime? now}) => _repair.state(
+        now: now ?? DateTime.now(),
+        safeMode: SafeBoot.instance.safeMode.value,
+      );
+
+  /// Feeds a content-free attunement signal from outside the suggestion
+  /// lifecycle: a reflex `stop`/`be quiet`/`cancel` while Neura was speaking
+  /// (`reflexInterruption`), the compassionate policy's `frustrated` support
+  /// signal or a correction chip (`explicitCorrection`), or reply feedback.
+  /// Accepted and dismissed suggestions are observed automatically by
+  /// [recordOutcome]; callers do not report those again.
+  void observeAttunementSignal(
+    NeuraAttunementSignal signal, {
+    DateTime? now,
+  }) {
+    if (_writesSuspended) return;
+    _repair.observe(
+      signal,
+      now: now ?? DateTime.now(),
+      safeMode: SafeBoot.instance.safeMode.value,
+    );
+    notifyListeners();
+  }
+
+  /// Hands out a repair id when, and only when, the engine asked for an
+  /// acknowledge-and-ask move. The caller shows the repair chip with it.
+  String? beginRepair({DateTime? now}) {
+    if (_writesSuspended) return null;
+    final id = _repair.beginRepair(
+      now: now ?? DateTime.now(),
+      safeMode: SafeBoot.instance.safeMode.value,
+    );
+    if (id != null) notifyListeners();
+    return id;
+  }
+
+  /// Records the user's answer to a repair as a pending correction. Returns
+  /// the proposal, or null if the id, category or text was not accepted.
+  NeuraCorrectionProposal? completeRepair({
+    required String repairId,
+    required String category,
+    required String userCorrection,
+    DateTime? now,
+  }) {
+    if (_writesSuspended) return null;
+    final proposal = _repair.completeRepair(
+      repairId: repairId,
+      category: category,
+      userCorrection: userCorrection,
+      now: now ?? DateTime.now(),
+    );
+    if (proposal == null) return null;
+    _pendingCorrections.add(proposal);
+    while (_pendingCorrections.length > _maxPendingCorrections) {
+      _pendingCorrections.removeAt(0);
+    }
+    notifyListeners();
+    return proposal;
+  }
+
+  /// Removes a pending correction once the user admitted it elsewhere or
+  /// discarded it. Returns whether anything was removed.
+  bool resolveCorrection(String proposalId) {
+    final before = _pendingCorrections.length;
+    _pendingCorrections.removeWhere((item) => item.id == proposalId);
+    final removed = _pendingCorrections.length != before;
+    if (removed) notifyListeners();
+    return removed;
   }
 
   Future<void> updatePreferences(
@@ -273,8 +377,9 @@ class NeuraIntelligenceController extends ChangeNotifier {
 
   Future<void> _updateOutcome(
     String receiptId,
-    NeuraSuggestionOutcome outcome,
-  ) async {
+    NeuraSuggestionOutcome outcome, {
+    DateTime? now,
+  }) async {
     if (_writesSuspended) return;
     final generation = _dataGeneration;
     await initialize();
@@ -294,6 +399,13 @@ class NeuraIntelligenceController extends ChangeNotifier {
     if (outcome == NeuraSuggestionOutcome.acted ||
         outcome == NeuraSuggestionOutcome.dismissed) {
       _nudgeSpecialistReputation(current.receipt.specialistId, outcome);
+      _repair.observe(
+        outcome == NeuraSuggestionOutcome.acted
+            ? NeuraAttunementSignal.acceptedSuggestion
+            : NeuraAttunementSignal.dismissedSuggestion,
+        now: now ?? DateTime.now(),
+        safeMode: SafeBoot.instance.safeMode.value,
+      );
     }
     notifyListeners();
     await _persist();
@@ -417,6 +529,8 @@ class NeuraIntelligenceController extends ChangeNotifier {
     _preferences = const NeuraIntelligencePreferences();
     _records = [];
     _specialistReputation = {};
+    _repair.reset();
+    _pendingCorrections.clear();
     _lastCouncil = const NeuraCouncilResult([]);
     _writeQueue = Future<void>.value();
     _initialized = false;

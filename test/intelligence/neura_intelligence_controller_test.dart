@@ -3,6 +3,7 @@ import 'package:neuro_companion/intelligence/capability_registry.dart';
 import 'package:neuro_companion/intelligence/intelligence_preferences.dart';
 import 'package:neuro_companion/intelligence/models.dart';
 import 'package:neuro_companion/intelligence/neura_intelligence_controller.dart';
+import 'package:neuro_companion/intelligence/rupture_repair.dart';
 import 'package:neuro_companion/reliability/safe_boot.dart';
 import 'package:neuro_companion/startup/neura_prefs_cache.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -186,6 +187,183 @@ void main() {
       );
     },
   );
+  group('rupture and repair wiring', () {
+    test('repeated dismissals hold later candidates back with a reason',
+        () async {
+      final controller = NeuraIntelligenceController.instance;
+      var now = DateTime.utc(2026, 8, 14, 18);
+
+      // Three dismissals a minute apart cross the "say less" threshold
+      // (0.18 each, 30 minute half-life) without reaching the repair one.
+      for (var i = 0; i < 3; i++) {
+        final result = await controller.evaluateCandidates(
+          candidates: [_candidate(now, id: 'dismissed-$i')],
+          now: now,
+        );
+        await controller.recordOutcome(
+          receiptId: result.visible.single.receipt.id,
+          acted: false,
+          now: now,
+        );
+        now = now.add(const Duration(minutes: 1));
+      }
+
+      final state = controller.repairState(now: now);
+      expect(state.move, NeuraRepairMove.quietDown);
+      expect(state.suggestsSuppression, isTrue);
+
+      final next = await controller.evaluateCandidates(
+        candidates: [_candidate(now, id: 'after-dismissals')],
+        now: now,
+      );
+      final receipt = next.decisions.single.receipt;
+      expect(receipt.reasons.join(' '), contains('Rupture & Repair'));
+      expect(
+        receipt.reasons.join(' '),
+        contains('A recent dismissal reduced the candidate score.'),
+      );
+    });
+
+    test('a repair can only begin when the engine asked for one', () async {
+      final controller = NeuraIntelligenceController.instance;
+      final now = DateTime.utc(2026, 8, 14, 18);
+
+      expect(controller.beginRepair(now: now), isNull);
+
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.explicitCorrection,
+        now: now,
+      );
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.reflexInterruption,
+        now: now,
+      );
+      expect(
+        controller.repairState(now: now).move,
+        NeuraRepairMove.acknowledgeAndAsk,
+      );
+
+      final id = controller.beginRepair(now: now);
+      expect(id, isNotNull);
+      expect(controller.beginRepair(now: now), isNull);
+    });
+
+    test('completing a repair queues a reviewable correction', () async {
+      final controller = NeuraIntelligenceController.instance;
+      final now = DateTime.utc(2026, 8, 14, 18);
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.explicitCorrection,
+        now: now,
+      );
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.negativeFeedback,
+        now: now,
+      );
+      final id = controller.beginRepair(now: now)!;
+
+      expect(
+        controller.completeRepair(
+          repairId: 'wrong',
+          category: 'tone',
+          userCorrection: 'softer',
+          now: now,
+        ),
+        isNull,
+      );
+      final proposal = controller.completeRepair(
+        repairId: id,
+        category: 'tone',
+        userCorrection: 'Softer in the evenings.',
+        now: now.add(const Duration(minutes: 1)),
+      );
+      expect(proposal, isNotNull);
+      expect(controller.pendingCorrections, hasLength(1));
+      expect(controller.pendingCorrections.single.id, id);
+      expect(
+        controller.repairState(now: now.add(const Duration(minutes: 1))).move,
+        NeuraRepairMove.none,
+      );
+
+      expect(controller.resolveCorrection('missing'), isFalse);
+      expect(controller.resolveCorrection(id), isTrue);
+      expect(controller.pendingCorrections, isEmpty);
+    });
+
+    test('correction text never reaches the persisted state', () async {
+      final controller = NeuraIntelligenceController.instance;
+      final now = DateTime.utc(2026, 8, 14, 18);
+      await controller.evaluateCandidates(
+        candidates: [_candidate(now)],
+        now: now,
+      );
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.explicitCorrection,
+        now: now,
+      );
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.negativeFeedback,
+        now: now,
+      );
+      final id = controller.beginRepair(now: now)!;
+      controller.completeRepair(
+        repairId: id,
+        category: 'timing',
+        userCorrection: 'Private correction text',
+        now: now,
+      );
+      await controller.updatePreferences(controller.preferences);
+
+      final stored = NeuraPrefsCache.prefs.getString(
+        'neura.intelligence.state.v1',
+      );
+      expect(stored, isNotNull);
+      expect(stored, isNot(contains('Private correction text')));
+    });
+
+    test('Safe Mode never asks for a repair', () async {
+      final controller = NeuraIntelligenceController.instance;
+      final now = DateTime.utc(2026, 8, 14, 18);
+      SafeBoot.instance.safeMode.value = true;
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.explicitCorrection,
+        now: now,
+      );
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.negativeFeedback,
+        now: now,
+      );
+      expect(controller.repairState(now: now).move, NeuraRepairMove.quietDown);
+      expect(controller.beginRepair(now: now), isNull);
+    });
+
+    test('a data wipe clears repair pressure and pending corrections',
+        () async {
+      final controller = NeuraIntelligenceController.instance;
+      final now = DateTime.utc(2026, 8, 14, 18);
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.explicitCorrection,
+        now: now,
+      );
+      controller.observeAttunementSignal(
+        NeuraAttunementSignal.negativeFeedback,
+        now: now,
+      );
+      final id = controller.beginRepair(now: now)!;
+      controller.completeRepair(
+        repairId: id,
+        category: 'other',
+        userCorrection: 'anything',
+        now: now,
+      );
+      expect(controller.pendingCorrections, hasLength(1));
+
+      await controller.resetAfterDataWipe();
+      controller.resumeAfterDataWipe();
+
+      expect(controller.pendingCorrections, isEmpty);
+      expect(controller.repairState(now: now).score, 0);
+    });
+  });
 }
 
 NeuraIntelligenceCandidate _candidate(
