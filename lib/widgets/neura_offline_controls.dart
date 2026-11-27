@@ -240,6 +240,22 @@ class _NeuraOfflineControlsState extends State<NeuraOfflineControls>
                     : (value) => NeuraOfflineWarmth.enabled.value = value,
               ),
             ),
+            ValueListenableBuilder<bool>(
+              valueListenable: NeuraOfflineStreaming.enabled,
+              builder: (context, streaming, _) => SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text("Show replies as they're written"),
+                subtitle: const Text(
+                  'Neura replies sentence by sentence. Each sentence is '
+                  'checked before it appears or is spoken. Off after restart, '
+                  'Safe Mode or recovery.',
+                ),
+                value: streaming,
+                onChanged: _blocked
+                    ? null
+                    : (value) => NeuraOfflineStreaming.enabled.value = value,
+              ),
+            ),
             TextButton(
               onPressed: _checking || _blocked ? null : _check,
               child: Text(_checking ? 'Checking…' : 'Check available RAM'),

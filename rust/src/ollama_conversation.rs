@@ -15,6 +15,10 @@ use crate::local_model::{bounded_json, memory_admitted, ENDPOINT, LOCAL_MODEL};
 const MAX_REQUEST: usize = 16_384;
 const MAX_RESPONSE: usize = 32_768;
 const MAX_REPLY: usize = 8_192;
+/// Streaming sends one small NDJSON object per token, so the wire total is
+/// larger than the reply. Both the total and every single line stay bounded.
+const MAX_STREAM: usize = 524_288;
+const MAX_STREAM_LINE: usize = 16_384;
 const READINESS_FIELDS: usize = 7;
 
 #[derive(Deserialize, Serialize)]
@@ -36,6 +40,13 @@ struct Request {
     /// replies. Absent or false keeps the original `keep_alive: 0`.
     #[serde(default)]
     warm: Option<bool>,
+    /// Optional incremental delivery. When true the adapter reads Ollama's
+    /// NDJSON stream and exposes the growing text through
+    /// `neura_ollama_partial`, under the same validation, bounds and
+    /// cancellation as a complete reply. Screening stays with the caller,
+    /// which must check text before it is displayed or spoken.
+    #[serde(default)]
+    stream: Option<bool>,
 }
 
 /// Bounded conversation profiles. Each larger profile raises both the native
@@ -151,7 +162,8 @@ fn prepare_with_profile(raw: &[u8]) -> Result<(Value, Profile), ()> {
         json!(0)
     };
     Ok((
-        json!({"model": LOCAL_MODEL, "messages": messages, "stream": false, "think": false,
+        json!({"model": LOCAL_MODEL, "messages": messages,
+        "stream": request.stream == Some(true), "think": false,
         "keep_alive": keep_alive, "options": {"num_ctx":profile.num_ctx(),
         "num_predict":profile.num_predict(), "num_thread":2,"temperature":0.6}}),
         profile,
@@ -160,13 +172,85 @@ fn prepare_with_profile(raw: &[u8]) -> Result<(Value, Profile), ()> {
 
 #[cfg(test)]
 async fn inference(endpoint: &str, payload: Value) -> Result<String, ()> {
-    timed_inference(endpoint, payload, &Mutex::new(RequestTiming::default())).await
+    timed_inference(
+        endpoint,
+        payload,
+        &Mutex::new(RequestTiming::default()),
+        &Partial::default(),
+    )
+    .await
+}
+
+/// Growing streamed text for one request. Zeroized on replacement and drop.
+type Partial = Mutex<Zeroizing<Vec<u8>>>;
+
+/// Validate one streamed or complete chat object and append its content.
+/// Returns whether Ollama marked the reply done.
+fn accept_chunk(value: &Value, text: &mut Zeroizing<String>) -> Result<bool, ()> {
+    let message = &value["message"];
+    if value.get("remote_host").is_some()
+        || value.get("remote_model").is_some()
+        || value.get("error").is_some()
+        || message["role"] != "assistant"
+        || message
+            .get("tool_calls")
+            .is_some_and(|v| !v.as_array().is_some_and(|a| a.is_empty()))
+    {
+        return Err(());
+    }
+    let content = message["content"].as_str().ok_or(())?;
+    if text.len() + content.len() > MAX_REPLY {
+        return Err(());
+    }
+    text.push_str(content);
+    Ok(value["done"] == true)
+}
+
+async fn read_stream(mut response: reqwest::Response, partial: &Partial) -> Result<String, ()> {
+    if !response.status().is_success() {
+        return Err(());
+    }
+    let mut pending = Zeroizing::new(Vec::new());
+    let mut text = Zeroizing::new(String::new());
+    let mut total = 0usize;
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        total += chunk.len();
+        if total > MAX_STREAM {
+            return Err(());
+        }
+        pending.extend_from_slice(&chunk);
+        while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+            let line = Zeroizing::new(pending.drain(..=end).collect::<Vec<u8>>());
+            if line.len() > MAX_STREAM_LINE {
+                return Err(());
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let value: Value = serde_json::from_slice(&line).map_err(|_| ())?;
+            let done = accept_chunk(&value, &mut text)?;
+            *partial.lock().unwrap_or_else(|p| p.into_inner()) =
+                Zeroizing::new(text.as_bytes().to_vec());
+            if done {
+                if text.trim().is_empty() {
+                    return Err(());
+                }
+                return Ok(text.to_string());
+            }
+        }
+        if pending.len() > MAX_STREAM_LINE {
+            return Err(());
+        }
+    }
+    // The stream ended without a final `done` object: incomplete, not a reply.
+    Err(())
 }
 
 async fn timed_inference(
     endpoint: &str,
     payload: Value,
     timing: &Mutex<RequestTiming>,
+    partial: &Partial,
 ) -> Result<String, ()> {
     let client = crate::local_model::LoopbackClient::new(endpoint, Duration::from_secs(90))?;
     // Fail before submitting conversation text if this tag is a remote model
@@ -178,42 +262,36 @@ async fn timed_inference(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .preflight_done();
-    let response = bounded_json(
-        client
-            .post_json("/api/chat", &payload)
-            .send()
-            .await
-            .map_err(|_| ())?,
-        MAX_RESPONSE,
-    )
-    .await?;
-    let message = &response["message"];
-    if response.get("remote_host").is_some()
-        || response.get("remote_model").is_some()
-        || response["done"] != true
-        || message["role"] != "assistant"
-        || message
-            .get("tool_calls")
-            .is_some_and(|v| !v.as_array().is_some_and(|a| a.is_empty()))
-    {
+    let streaming = payload["stream"] == true;
+    let response = client
+        .post_json("/api/chat", &payload)
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if streaming {
+        return read_stream(response, partial).await;
+    }
+    let response = bounded_json(response, MAX_RESPONSE).await?;
+    let mut text = Zeroizing::new(String::new());
+    if !accept_chunk(&response, &mut text)? || text.trim().is_empty() {
         return Err(());
     }
-    let text = message["content"].as_str().ok_or(())?;
-    if text.trim().is_empty() || text.len() > MAX_REPLY {
-        return Err(());
-    }
-    Ok(text.to_owned())
+    Ok(text.to_string())
 }
 
 async fn cancellable_inference(
     endpoint: &str,
     payload: Value,
     timing: &Mutex<RequestTiming>,
+    partial: &Partial,
     receiver: &mut watch::Receiver<bool>,
 ) -> Result<String, ()> {
     tokio::select! { biased;
         _ = receiver.changed() => Err(()),
-        result = tokio::time::timeout(Duration::from_secs(90), timed_inference(endpoint, payload, timing)) => result.map_err(|_| ())?,
+        result = tokio::time::timeout(
+            Duration::from_secs(90),
+            timed_inference(endpoint, payload, timing, partial),
+        ) => result.map_err(|_| ())?,
     }
 }
 
@@ -270,6 +348,7 @@ struct State {
     reply: Option<Zeroizing<Vec<u8>>>,
     readiness: Option<[u64; READINESS_FIELDS]>,
     timing: Option<(i64, Arc<Mutex<RequestTiming>>)>,
+    partial: Option<Arc<Partial>>,
 }
 struct Active {
     cancel: watch::Sender<bool>,
@@ -288,6 +367,7 @@ impl Session {
         }
         state.generation += 1;
         state.reply = None;
+        state.partial = None;
         state.readiness = None;
         state.status = -2;
         if let Some(active) = &self.active {
@@ -332,9 +412,11 @@ impl Session {
         let timing = payload
             .as_ref()
             .map(|_| Arc::new(Mutex::new(RequestTiming::default())));
+        let partial = payload.as_ref().map(|_| Arc::new(Partial::default()));
         let generation = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state.status = 0;
+            state.partial = partial.clone();
             state.timing = timing
                 .as_ref()
                 .map(|value| (state.generation, value.clone()));
@@ -359,6 +441,7 @@ impl Session {
                                         ENDPOINT,
                                         payload,
                                         timing.as_ref().ok_or(())?,
+                                        partial.as_deref().ok_or(())?,
                                         &mut receiver,
                                     )
                                     .await
@@ -381,6 +464,8 @@ impl Session {
                 if generation != state.generation || state.blocked || !state.foreground {
                     return;
                 }
+                // The complete reply supersedes the partial view.
+                state.partial = None;
                 match result {
                     Ok(Ok(Completion::Reply(text))) => {
                         state.reply = Some(Zeroizing::new(text.into_bytes()));
@@ -503,6 +588,38 @@ pub unsafe extern "C" fn neura_ollama_poll(id: i64, buffer: *mut u8, capacity: u
     state.reply = None;
     state.status = -2;
     len as i32
+}
+/// Copy the text streamed so far for request `id`, without consuming it.
+/// Returns its byte length (0 before the first token), -5 once the complete
+/// reply is ready for `neura_ollama_poll`, -1 on failure or a too-small
+/// buffer, and -2 when stopped, replaced, blocked or backgrounded. The
+/// caller must screen this text before displaying or speaking any of it.
+/// # Safety
+/// `buffer` must point to `capacity` writable bytes for this synchronous call.
+#[no_mangle]
+pub unsafe extern "C" fn neura_ollama_partial(id: i64, buffer: *mut u8, capacity: usize) -> i32 {
+    let session = session().lock().unwrap_or_else(|p| p.into_inner());
+    let state = session.state.lock().unwrap_or_else(|p| p.into_inner());
+    if id != state.generation || state.blocked || !state.foreground {
+        return -2;
+    }
+    match state.status {
+        0 => {}
+        1 => return -5,
+        status => return status,
+    }
+    let Some(partial) = state.partial.as_ref() else {
+        return 0;
+    };
+    let text = partial.lock().unwrap_or_else(|p| p.into_inner());
+    if buffer.is_null() || capacity < text.len() {
+        return -1;
+    }
+    // SAFETY: caller provides a separate, sufficiently sized output buffer.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buffer, text.len());
+    }
+    text.len() as i32
 }
 #[no_mangle]
 pub extern "C" fn neura_ollama_cancel(id: i64) {
@@ -1003,8 +1120,14 @@ mod tests {
         let worker_timing = timing.clone();
         let (cancel, mut receiver) = watch::channel(false);
         let request = tokio::spawn(async move {
-            let result =
-                cancellable_inference(&endpoint, payload(), &worker_timing, &mut receiver).await;
+            let result = cancellable_inference(
+                &endpoint,
+                payload(),
+                &worker_timing,
+                &Partial::default(),
+                &mut receiver,
+            )
+            .await;
             worker_timing.lock().unwrap().worker_done(result.is_ok());
             result
         });
@@ -1040,6 +1163,191 @@ mod tests {
             assert!(inference(&endpoint, payload()).await.is_err());
             task.abort();
         }
+    }
+    async fn stream_mock(body: String) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json};
+        let router = crate::local_model::tests::metadata_router()
+            .route("/api/show", post(|| async { Json(local_info()) }))
+            .route(
+                "/api/chat",
+                post(move |Json(request): Json<Value>| async move {
+                    assert_eq!(request["stream"], true);
+                    assert!(request.get("tools").is_none());
+                    body
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (endpoint, task)
+    }
+    fn stream_payload() -> Value {
+        prepare(br#"{"system":"x","messages":[{"role":"user","content":"Hi"}],"stream":true}"#)
+            .unwrap()
+    }
+    fn line(content: &str, done: bool) -> String {
+        format!(
+            "{}\n",
+            json!({"done":done,"message":{"role":"assistant","content":content}})
+        )
+    }
+    #[test]
+    fn streaming_is_explicit() {
+        let raw = |extra: &str| {
+            format!(r#"{{"system":"x","messages":[{{"role":"user","content":"x"}}]{extra}}}"#)
+        };
+        assert_eq!(prepare(raw("").as_bytes()).unwrap()["stream"], false);
+        assert_eq!(
+            prepare(raw(r#","stream":false"#).as_bytes()).unwrap()["stream"],
+            false
+        );
+        assert_eq!(
+            prepare(raw(r#","stream":true"#).as_bytes()).unwrap()["stream"],
+            true
+        );
+        assert!(prepare(raw(r#","stream":"yes""#).as_bytes()).is_err());
+    }
+    #[tokio::test]
+    async fn streamed_reply_accumulates_and_exposes_partial_text() {
+        let body = [
+            line("Hi, ", false),
+            line("I'm Neura.", false),
+            line("", true),
+        ]
+        .concat();
+        let (endpoint, task) = stream_mock(body).await;
+        let partial = Partial::default();
+        let text = timed_inference(
+            &endpoint,
+            stream_payload(),
+            &Mutex::new(RequestTiming::default()),
+            &partial,
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "Hi, I'm Neura.");
+        assert_eq!(&partial.lock().unwrap()[..], b"Hi, I'm Neura.");
+        task.abort();
+    }
+    #[tokio::test]
+    async fn partial_text_grows_before_the_stream_finishes() {
+        use axum::{body::Body, routing::post, Json};
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(4);
+        let body = Arc::new(Mutex::new(Some(receiver)));
+        let router = crate::local_model::tests::metadata_router()
+            .route("/api/show", post(|| async { Json(local_info()) }))
+            .route(
+                "/api/chat",
+                post(move || {
+                    let receiver = body.lock().unwrap().take().unwrap();
+                    async move { Body::from_stream(tokio_stream_from(receiver)) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let partial = Arc::new(Partial::default());
+        let worker_partial = partial.clone();
+        let request = tokio::spawn(async move {
+            timed_inference(
+                &endpoint,
+                stream_payload(),
+                &Mutex::new(RequestTiming::default()),
+                &worker_partial,
+            )
+            .await
+        });
+        let wait_for = |expected: &'static [u8]| {
+            let partial = partial.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while partial.lock().unwrap()[..] != *expected {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        };
+        sender.send(Ok(line("Hi. ", false))).await.unwrap();
+        wait_for(b"Hi. ").await;
+        assert!(!request.is_finished());
+        sender.send(Ok(line("More.", false))).await.unwrap();
+        wait_for(b"Hi. More.").await;
+        assert!(!request.is_finished());
+        sender.send(Ok(line("", true))).await.unwrap();
+        assert_eq!(request.await.unwrap().unwrap(), "Hi. More.");
+        server.abort();
+    }
+    fn tokio_stream_from(
+        mut receiver: tokio::sync::mpsc::Receiver<Result<String, std::io::Error>>,
+    ) -> impl futures_util::Stream<Item = Result<String, std::io::Error>> {
+        futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx))
+    }
+    #[tokio::test]
+    async fn streamed_reply_rejects_unsafe_incomplete_and_oversized_streams() {
+        let tool =
+            json!({"done":false,"message":{"role":"assistant","content":"x","tool_calls":[{}]}});
+        let remote = json!({"done":false,"remote_model":"x",
+            "message":{"role":"assistant","content":"x"}});
+        let long_line = format!(
+            "{}\n",
+            json!({"done":false,"message":{"role":"assistant",
+                "content":"x".repeat(MAX_STREAM_LINE)}})
+        );
+        for body in [
+            // Never finished.
+            line("Hi", false),
+            // Finished but empty.
+            line(" ", true),
+            // Tool calls and remote models are refused mid-stream.
+            format!("{}{tool}\n{}", line("Hi", false), line("", true)),
+            format!("{remote}\n{}", line("", true)),
+            // Malformed object.
+            format!("{}not json\n{}", line("Hi", false), line("", true)),
+            // Over the reply cap across many small chunks.
+            [
+                (0..=MAX_REPLY / 512)
+                    .map(|_| line(&"x".repeat(512), false))
+                    .collect::<String>(),
+                line("", true),
+            ]
+            .concat(),
+            // A single line over the line cap.
+            long_line,
+        ] {
+            let (endpoint, task) = stream_mock(body).await;
+            assert!(timed_inference(
+                &endpoint,
+                stream_payload(),
+                &Mutex::new(RequestTiming::default()),
+                &Partial::default(),
+            )
+            .await
+            .is_err());
+            task.abort();
+        }
+    }
+    #[test]
+    fn partial_view_is_cleared_by_cancel() {
+        let mut s = Session::default();
+        {
+            let mut state = s.state.lock().unwrap();
+            state.foreground = true;
+            state.status = 0;
+            let partial = Arc::new(Partial::default());
+            *partial.lock().unwrap() = Zeroizing::new(b"Hello.".to_vec());
+            state.partial = Some(partial);
+        }
+        assert!(s.state.lock().unwrap().partial.is_some());
+        s.cancel();
+        let state = s.state.lock().unwrap();
+        assert!(state.partial.is_none());
+        assert_eq!(state.status, -2);
     }
     #[tokio::test]
     async fn rejects_advertised_oversize_without_waiting_for_body() {

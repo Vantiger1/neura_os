@@ -134,6 +134,16 @@ class NeuraOllamaTextInputFormatter extends TextInputFormatter {
 }
 
 /// Windows native owner forwards text to Rust; no Dart HTTP or cloud fallback.
+/// Receives the unscreened text streamed so far (always a growing prefix of
+/// the reply). Returns false to stop the request, for example when
+/// screening blocks it. It must never display or speak unscreened text.
+typedef NeuraOfflinePartialHandler = Future<bool> Function(String partial);
+
+/// The partial handler stopped a streamed reply. Native work is cancelled.
+class NeuraOfflineStreamStopped implements Exception {
+  const NeuraOfflineStreamStopped();
+}
+
 class NeuraOllamaChat with WidgetsBindingObserver {
   static const maxInputBytes = 1500;
   static const maxVisibleMessages = 8;
@@ -341,6 +351,7 @@ class NeuraOllamaChat with WidgetsBindingObserver {
     required NeuraGenerationCancel cancel,
     NeuraOfflineBudget budget = NeuraOfflineBudget.standard,
     bool warm = false,
+    NeuraOfflinePartialHandler? onPartial,
   }) async {
     if (!_allowed) throw StateError('Offline chat is unavailable.');
     cancel.throwIfCancelled();
@@ -352,6 +363,7 @@ class NeuraOllamaChat with WidgetsBindingObserver {
       'messages': messages,
       if (budget.nativeProfile != null) 'profile': budget.nativeProfile,
       if (warm) 'warm': true,
+      if (onPartial != null) 'stream': true,
     });
     if (utf8.encode(payload).length > 16384) {
       throw StateError('This conversation is too large for offline chat.');
@@ -363,6 +375,7 @@ class NeuraOllamaChat with WidgetsBindingObserver {
     int? nativeId;
     var finished = false;
     var delivered = false;
+    var partialSeen = 0;
     unawaited(
       cancel.whenCancelled.then((_) {
         if (timing.total == null) timing.cancelAt ??= _now;
@@ -394,10 +407,26 @@ class NeuraOllamaChat with WidgetsBindingObserver {
           delivered = true;
           return text;
         }
+        if (onPartial != null) {
+          // Unscreened text so far. The handler screens it before release
+          // and may stop the request; nothing here displays or speaks it.
+          final partial =
+              await _channel.invokeMethod<String>('partialOllama', id);
+          cancel.throwIfCancelled();
+          if (!_allowed) throw NeuraGenerationCancelled(cancel.generationId);
+          if (partial != null && partial.length > partialSeen) {
+            partialSeen = partial.length;
+            final keepGoing = await onPartial(partial);
+            cancel.throwIfCancelled();
+            if (!keepGoing) throw const NeuraOfflineStreamStopped();
+          }
+        }
         await cancel.delay(const Duration(milliseconds: 100));
       }
       throw StateError('Offline reply timed out.');
     } on NeuraGenerationCancelled {
+      rethrow;
+    } on NeuraOfflineStreamStopped {
       rethrow;
     } catch (_) {
       cancel.throwIfCancelled();
@@ -443,6 +472,7 @@ class NeuraOllamaChat with WidgetsBindingObserver {
     }
     _blocked = true;
     NeuraOfflineWarmth.enabled.value = false;
+    NeuraOfflineStreaming.enabled.value = false;
     clearLatency();
     _active?.cancel();
     if (_supported) {
